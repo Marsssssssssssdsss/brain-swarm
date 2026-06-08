@@ -16,6 +16,7 @@ class DroneCommand:
     action_label: str
     behavior_type: str
     params: Dict[str, Any] = field(default_factory=dict)
+    source: str = "mi"  # 来源: mi, ssvep, bio
 
 
 class ActionMapper:
@@ -109,3 +110,10 @@ class ActionMapper:
             }
             for cmd in self.actions.values()
         ]
+
+    def get_action_by_type(self, behavior_type: str) -> Optional[DroneCommand]:
+        """通过行为类型查找动作"""
+        for cmd in self.actions.values():
+            if cmd.behavior_type == behavior_type:
+                return cmd
+        return None
