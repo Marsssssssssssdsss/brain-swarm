@@ -6,16 +6,20 @@
 3. 自适应阈值：根据用户基线动态调整触发灵敏度
 4. 基线校准：学习用户静息态特征
 5. 漂移补偿：跨会话和多时间尺度漂移修正
+6. FBCSP 特征提取 + LDA 分类器 (替代纯阈值方法)
+7. 小波变换去噪 (论文级伪迹去除)
 """
 
 import numpy as np
-from scipy import signal
+from scipy import signal, linalg
 from typing import Tuple, Optional, Dict, List
 from dataclasses import dataclass, field
 from collections import deque
 import time
 import json
 import os
+import warnings
+from scipy.signal import butter, sosfilt, filtfilt
 
 
 # ─── 数据结构 ────────────────────────────────────────────
@@ -154,6 +158,65 @@ class ArtifactDetector:
 
         is_blink = kurtosis > self.kurtosis_threshold and high_ratio > 0.3
         return is_blink, kurtosis
+
+    def wavelet_denoise(self, data: np.ndarray, wavelet_name: str = "db4",
+                        level: int = 5, threshold_mode: str = "soft",
+                        threshold_scale: float = 1.0) -> np.ndarray:
+        """
+        小波变换去噪 (对标论文级伪迹去除方法)
+
+        原理: 将EEG信号分解到小波域, 对小尺度(高频)系数做阈值处理,
+        保留大尺度(低频)系数, 再重构信号.
+        相比FIR/IIR滤波, 小波去噪能在去除噪声的同时更好地保留信号瞬态特征.
+
+        Args:
+            data: (n_channels, n_samples) 或 (n_samples,) EEG数据
+            wavelet_name: 小波基名称 (db4/sym8/coif5 等)
+            level: 分解层数
+            threshold_mode: 'soft' 或 'hard'
+            threshold_scale: 阈值缩放系数 (越大去噪越强)
+
+        Returns:
+            去噪后的数据, 形状与输入相同
+        """
+        try:
+            import pywt
+        except ImportError:
+            # 没有pywt库则返回原数据
+            return data
+
+        if data.ndim == 1:
+            data = data[np.newaxis, :]
+
+        n_channels, n_samples = data.shape
+        denoised = np.zeros_like(data)
+
+        for ch in range(n_channels):
+            # 小波分解
+            coeffs = pywt.wavedec(data[ch], wavelet_name, level=level)
+
+            # 估计噪声标准差 (使用第一层细节系数的中位数)
+            sigma = np.median(np.abs(coeffs[-1])) / 0.6745
+            threshold = sigma * np.sqrt(2 * np.log(n_samples)) * threshold_scale
+
+            # 对除最后一层近似系数外的所有细节系数做阈值处理
+            coeffs_thresholded = [coeffs[0]]  # 保留近似系数
+            for i in range(1, len(coeffs)):
+                if threshold_mode == "soft":
+                    coeffs_thresholded.append(
+                        pywt.threshold(coeffs[i], threshold, mode='soft')
+                    )
+                else:
+                    coeffs_thresholded.append(
+                        pywt.threshold(coeffs[i], threshold, mode='hard')
+                    )
+
+            # 重构
+            denoised[ch] = pywt.waverec(coeffs_thresholded, wavelet_name)[:n_samples]
+
+        if denoised.shape[0] == 1:
+            return denoised[0]
+        return denoised
 
     def full_check(self, segment: np.ndarray, sampling_rate: int = 250) -> Dict:
         """执行所有伪迹检测"""
@@ -639,6 +702,457 @@ class DriftCompensator:
         self._short_term_buffer.clear()
 
 
+# ─── FBCSP 特征提取 + LDA 分类器 ────────────────────────
+# FBCSP (Filter Bank Common Spatial Patterns):
+# 1. 将EEG信号滤波到多个频段 (滤波器组)
+# 2. 每个频段执行CSP (Common Spatial Patterns) 寻找最大化两类方差差异的空间滤波器
+# 3. 提取log-variance特征
+# 4. LDA (Linear Discriminant Analysis) 分类
+# 这是BCI Competition IV 2a 上最经典的基线方法, 4类平均准确率 ~67-73%
+
+class CommonSpatialPattern:
+    """
+    Common Spatial Patterns (CSP) 空间滤波器
+
+    CSP寻找一组空间滤波器, 使得一类信号的方差最大化, 另一类最小化.
+    适用于二分类运动想象 (如左手vs右手).
+    """
+
+    def __init__(self, n_filters: int = 4):
+        """
+        Args:
+            n_filters: 保留的空间滤波器对数 (每类保留n_filters个, 共2*n_filters个)
+        """
+        self.n_filters = n_filters
+        self.filters_: Optional[np.ndarray] = None
+        self.patterns_: Optional[np.ndarray] = None
+        self.fitted = False
+
+    def fit(self, X: np.ndarray, y: np.ndarray):
+        """
+        训练CSP空间滤波器
+
+        Args:
+            X: (n_trials, n_channels, n_samples) 训练数据
+            y: (n_trials,) 标签 (0 或 1)
+        """
+        classes = np.unique(y)
+        if len(classes) != 2:
+            raise ValueError(f"CSP需要二分类, 收到 {len(classes)} 类")
+
+        # 计算每类的协方差矩阵
+        covs = []
+        for cls in classes:
+            trials = X[y == cls]
+            n_trials = trials.shape[0]
+            # 每个trial的协方差矩阵
+            trial_covs = []
+            for i in range(n_trials):
+                trial = trials[i]
+                trial = trial - trial.mean(axis=-1, keepdims=True)
+                cov = trial @ trial.T / (trial.shape[1] - 1)
+                trial_covs.append(cov)
+            covs.append(np.mean(trial_covs, axis=0))
+
+        R1, R2 = covs[0], covs[1]
+        R = R1 + R2
+
+        # 广义特征值分解
+        try:
+            eigenvalues, eigenvectors = linalg.eigh(R1, R)
+        except linalg.LinAlgError:
+            # 添加正则项保证数值稳定性
+            R += np.eye(R.shape[0]) * 1e-10
+            eigenvalues, eigenvectors = linalg.eigh(R1, R)
+
+        # 按绝对值降序排列
+        idx = np.argsort(np.abs(eigenvalues))[::-1]
+        eigenvalues = eigenvalues[idx]
+        eigenvectors = eigenvectors[:, idx]
+
+        # 选择头尾各n_filters个滤波器
+        selected = np.concatenate([
+            idx[:self.n_filters],
+            idx[-self.n_filters:]
+        ])
+        self.filters_ = eigenvectors[:, selected]
+        self.patterns_ = linalg.inv(self.filters_.T)
+        self.fitted = True
+        return self
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        """
+        提取CSP特征 (log-variance)
+
+        Args:
+            X: (n_trials, n_channels, n_samples) 或 (n_channels, n_samples)
+
+        Returns:
+            features: (n_trials, 2*n_filters) log-variance特征
+        """
+        if not self.fitted:
+            raise RuntimeError("CSP未训练, 请先调用fit()")
+
+        if X.ndim == 2:
+            X = X[np.newaxis, ...]
+
+        n_trials = X.shape[0]
+        n_filters = self.filters_.shape[1]
+
+        features = np.zeros((n_trials, n_filters))
+        for i in range(n_trials):
+            # 空间滤波
+            projected = self.filters_.T @ X[i]
+            # log-variance特征
+            var = np.var(projected, axis=1)
+            # 归一化并取log
+            var_sum = var.sum()
+            if var_sum > 0:
+                var = var / var_sum
+            # 避免log(0)
+            var = np.clip(var, 1e-10, None)
+            features[i] = np.log(var)
+
+        return features
+
+    def fit_transform(self, X: np.ndarray, y: np.ndarray) -> np.ndarray:
+        """训练并提取特征"""
+        self.fit(X, y)
+        return self.transform(X)
+
+
+class FilterBankCSP:
+    """
+    Filter Bank Common Spatial Patterns (FBCSP)
+
+    将EEG信号分解到多个频段, 每个频段独立运行CSP, 拼接所有特征.
+    BCI Competition IV 2a 标准方法.
+
+    频段示例: [(4,8), (8,12), (12,16), (16,20), (20,24), (24,28), (28,32), (32,36)] Hz
+    """
+
+    def __init__(
+        self,
+        bands: List[Tuple[float, float]] = None,
+        n_filters: int = 4,
+        sampling_rate: int = 250,
+    ):
+        """
+        Args:
+            bands: 频段列表 [(low, high), ...]
+            n_filters: 每个频段保留的CSP滤波器对数
+            sampling_rate: 采样率 (Hz)
+        """
+        if bands is None:
+            bands = [
+                (4, 8), (8, 12), (12, 16), (16, 20),
+                (20, 24), (24, 28), (28, 32), (32, 36)
+            ]
+        self.bands = bands
+        self.n_filters = n_filters
+        self.sampling_rate = sampling_rate
+        self.csp_models: List[CommonSpatialPattern] = []
+        self._filters_built = False
+        self.fitted = False
+
+    def _build_filters(self):
+        """为每个频段构建带通滤波器"""
+        self._band_filters = []
+        nyquist = self.sampling_rate / 2.0
+        for low, high in self.bands:
+            if high >= nyquist:
+                high = nyquist - 0.5
+            sos = butter(4, [low / nyquist, high / nyquist], btype='band', output='sos')
+            self._band_filters.append(sos)
+        self._filters_built = True
+
+    def fit(self, X: np.ndarray, y: np.ndarray):
+        """
+        训练FBCSP
+
+        Args:
+            X: (n_trials, n_channels, n_samples) 训练数据
+            y: (n_trials,) 标签
+        """
+        if not self._filters_built:
+            self._build_filters()
+
+        self.csp_models = []
+        for band_idx, (low, high) in enumerate(self.bands):
+            # 频段滤波
+            X_filtered = np.zeros_like(X)
+            for i in range(X.shape[0]):
+                for ch in range(X.shape[1]):
+                    X_filtered[i, ch] = sosfilt(
+                        self._band_filters[band_idx], X[i, ch]
+                    )
+
+            # 该频段运行CSP
+            csp = CommonSpatialPattern(n_filters=self.n_filters)
+            csp.fit(X_filtered, y)
+            self.csp_models.append(csp)
+
+        self.fitted = True
+        return self
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        """
+        提取FBCSP特征
+
+        Args:
+            X: (n_trials, n_channels, n_samples)
+
+        Returns:
+            features: (n_trials, n_bands * 2 * n_filters) 拼接特征
+        """
+        if not self.fitted:
+            raise RuntimeError("FBCSP未训练, 请先调用fit()")
+        if not self._filters_built:
+            self._build_filters()
+
+        all_features = []
+        for band_idx in range(len(self.bands)):
+            # 频段滤波
+            X_filtered = np.zeros_like(X)
+            for i in range(X.shape[0]):
+                for ch in range(X.shape[1]):
+                    X_filtered[i, ch] = sosfilt(
+                        self._band_filters[band_idx], X[i, ch]
+                    )
+
+            # 提取CSP特征
+            features = self.csp_models[band_idx].transform(X_filtered)
+            all_features.append(features)
+
+        return np.concatenate(all_features, axis=1)
+
+    def fit_transform(self, X: np.ndarray, y: np.ndarray) -> np.ndarray:
+        """训练并提取特征"""
+        self.fit(X, y)
+        return self.transform(X)
+
+
+class LDAClassifier:
+    """
+    Linear Discriminant Analysis (LDA) 分类器
+
+    用于FBCSP特征的分类. 相比普通LDA实现:
+    - 支持多分类 (One-vs-Rest)
+    - 添加正则项处理高维小样本问题
+    - 输出类别概率
+    """
+
+    def __init__(self, shrinkage: float = 1e-6):
+        """
+        Args:
+            shrinkage: 正则化系数 (防止协方差矩阵奇异)
+        """
+        self.shrinkage = shrinkage
+        self.means_: List[np.ndarray] = []
+        self.prior_: List[float] = []
+        self.cov_inv_: Optional[np.ndarray] = None
+        self.classes_: Optional[np.ndarray] = None
+        self.fitted = False
+
+    def fit(self, X: np.ndarray, y: np.ndarray):
+        """
+        训练LDA
+
+        Args:
+            X: (n_samples, n_features)
+            y: (n_samples,) 标签
+        """
+        self.classes_ = np.unique(y)
+        n_classes = len(self.classes_)
+        n_features = X.shape[1]
+
+        # 计算每类均值
+        self.means_ = []
+        self.prior_ = []
+        for cls in self.classes_:
+            X_cls = X[y == cls]
+            self.means_.append(X_cls.mean(axis=0))
+            self.prior_.append(X_cls.shape[0] / X.shape[0])
+
+        # 计算类内协方差矩阵 (pooled)
+        cov = np.zeros((n_features, n_features))
+        for cls in self.classes_:
+            X_cls = X[y == cls]
+            centered = X_cls - X_cls.mean(axis=0)
+            cov += centered.T @ centered
+        cov /= (X.shape[0] - n_classes)
+
+        # 正则化
+        cov += self.shrinkage * np.eye(n_features)
+
+        # 求逆
+        self.cov_inv_ = linalg.inv(cov)
+        self.fitted = True
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """预测类别"""
+        scores = self.decision_function(X)
+        return self.classes_[scores.argmax(axis=1)]
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """
+        预测各类别概率
+
+        Args:
+            X: (n_samples, n_features)
+
+        Returns:
+            proba: (n_samples, n_classes) 概率分布
+        """
+        scores = self.decision_function(X)
+        # softmax 转概率
+        scores = scores - scores.max(axis=1, keepdims=True)
+        exp_scores = np.exp(scores)
+        proba = exp_scores / exp_scores.sum(axis=1, keepdims=True)
+        return proba
+
+    def decision_function(self, X: np.ndarray) -> np.ndarray:
+        """计算判别分数"""
+        if not self.fitted:
+            raise RuntimeError("LDA未训练")
+
+        n_samples = X.shape[0]
+        n_classes = len(self.classes_)
+        scores = np.zeros((n_samples, n_classes))
+
+        for i in range(n_classes):
+            mean = self.means_[i]
+            # 线性判别函数: w·x + b
+            w = self.cov_inv_ @ mean
+            b = -0.5 * (mean @ self.cov_inv_ @ mean) + np.log(self.prior_[i])
+            scores[:, i] = X @ w + b
+
+        return scores
+
+
+class FBCSPDecoder:
+    """
+    FBCSP + LDA 完整解码器
+
+    一站式完成: 频段滤波 → CSP特征提取 → LDA分类
+    支持在线 (predict_one) 和离线 (fit/predict) 模式
+    """
+
+    def __init__(
+        self,
+        n_classes: int = 4,
+        n_channels: int = 8,
+        sampling_rate: int = 250,
+        bands: Optional[List[Tuple[float, float]]] = None,
+        n_filters: int = 4,
+        confidence_threshold: float = 0.7,
+    ):
+        self.n_classes = n_classes
+        self.n_channels = n_channels
+        self.sampling_rate = sampling_rate
+        self.n_filters = n_filters
+        self.confidence_threshold = confidence_threshold
+
+        if bands is None:
+            bands = [
+                (4, 8), (8, 12), (12, 16), (16, 20),
+                (20, 24), (24, 28), (28, 32), (32, 36)
+            ]
+        self.bands = bands
+
+        # OvR (One-vs-Rest) 策略: 对每个类别训练一个二分类FBCSP+LDA
+        self._binary_classifiers: List[Tuple[FilterBankCSP, LDAClassifier]] = []
+        self.fitted = False
+
+    def fit(self, X: np.ndarray, y: np.ndarray):
+        """
+        训练多分类FBCSP+LDA (OvR策略)
+
+        Args:
+            X: (n_trials, n_channels, n_samples) 训练数据
+            y: (n_trials,) 标签 (0 到 n_classes-1)
+        """
+        self._binary_classifiers = []
+        for cls in range(self.n_classes):
+            # 构建二分类标签: 当前类 vs 其他所有类
+            y_binary = np.where(y == cls, 1, 0)
+
+            # 检查是否有正样本
+            if y_binary.sum() == 0:
+                warnings.warn(f"类别 {cls} 没有训练样本")
+                self._binary_classifiers.append((None, None))
+                continue
+
+            # FBCSP + LDA
+            fbcsp = FilterBankCSP(
+                bands=self.bands,
+                n_filters=self.n_filters,
+                sampling_rate=self.sampling_rate,
+            )
+            lda = LDAClassifier()
+            features = fbcsp.fit_transform(X, y_binary)
+            lda.fit(features, y_binary)
+
+            self._binary_classifiers.append((fbcsp, lda))
+
+        self.fitted = True
+        return self
+
+    def predict_one(self, trial: np.ndarray) -> Tuple[int, float]:
+        """
+        单次试次预测 (在线模式)
+
+        Args:
+            trial: (n_channels, n_samples) 单次EEG试次
+
+        Returns:
+            (predicted_class, confidence)
+        """
+        if trial.ndim == 2:
+            trial = trial[np.newaxis, ...]  # (1, n_channels, n_samples)
+
+        # 对每个OvR分类器获取概率
+        probas = np.zeros(self.n_classes)
+        for cls in range(self.n_classes):
+            fbcsp, lda = self._binary_classifiers[cls]
+            if fbcsp is None or lda is None:
+                probas[cls] = 0.0
+                continue
+            features = fbcsp.transform(trial)
+            proba = lda.predict_proba(features)
+            # 取"属于该类"的概率 (OvR二分类的class 1)
+            probas[cls] = proba[0, 1]
+
+        predicted = probas.argmax()
+        confidence = probas[predicted]
+
+        # 置信度低于阈值则拒绝 (认为不可靠)
+        if confidence < self.confidence_threshold:
+            return -1, confidence
+
+        return predicted, confidence
+
+    def predict(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        批量预测
+
+        Args:
+            X: (n_trials, n_channels, n_samples)
+
+        Returns:
+            (predictions, confidences)
+        """
+        predictions = []
+        confidences = []
+        for i in range(X.shape[0]):
+            pred, conf = self.predict_one(X[i])
+            predictions.append(pred)
+            confidences.append(conf)
+
+        return np.array(predictions), np.array(confidences)
+
+
 # ─── 综合信号增强器 ──────────────────────────────────────
 
 class SignalEnhancer:
@@ -656,15 +1170,31 @@ class SignalEnhancer:
             if not artifacts['any_artifact']:
                 # 信号OK，继续处理
                 pass
+                
+    FBCSP 解码器集成:
+        enhancer = SignalEnhancer(sampling_rate=250, enable_decoder=True)
+        enhancer.decoder.fit(X_train, y_train)  # 训练FBCSP+LDA
+        pred, conf = enhancer.decoder.predict_one(trial)  # 在线预测
     """
 
-    def __init__(self, sampling_rate: int = 250, line_freq: float = 50.0):
+    def __init__(self, sampling_rate: int = 250, line_freq: float = 50.0,
+                 enable_decoder: bool = False,
+                 n_classes: int = 6, n_channels: int = 8):
         self.sampling_rate = sampling_rate
         self.quality_monitor = SignalQualityMonitor(sampling_rate, line_freq)
         self.artifact_detector = ArtifactDetector()
         self.calibrator = BaselineCalibrator()
         self.adaptive_threshold = AdaptiveThreshold()
         self.drift_compensator = DriftCompensator(sampling_rate=sampling_rate)
+        self.enable_decoder = enable_decoder
+        self.decoder = None
+        if enable_decoder:
+            self.decoder = FBCSPDecoder(
+                n_classes=n_classes,
+                n_channels=n_channels,
+                sampling_rate=sampling_rate,
+                confidence_threshold=0.7,
+            )
 
     def calibrate(self) -> BaselineCalibrator:
         """开始基线校准"""
