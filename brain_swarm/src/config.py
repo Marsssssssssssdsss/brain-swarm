@@ -16,17 +16,29 @@ class EEGConfig:
     """EEG 采集配置"""
     n_channels: int = 8
     sampling_rate: int = 250       # Hz
-    low_freq: float = 1.0          # 带通滤波下限
-    high_freq: float = 50.0        # 带通滤波上限
+    low_freq: float = 0.5          # 带通滤波下限 (0.5Hz 保留慢皮层电位SCP)
+    high_freq: float = 100.0       # 带通滤波上限 (100Hz 包含gamma频段信息)
     notch_freq: float = 50.0       # 陷波滤波器频率
 
 
 @dataclass
 class SignalEnhancementConfig:
     """信号增强配置 —— 解决信号衰减问题"""
-    # 基线校准
+    # 基线校准 (BCI研究标准: 2-5分钟基线, 30秒方差过大会导致Z-score阈值不可靠)
     enable_baseline_calibration: bool = True
-    calibration_duration: float = 30.0      # 校准时长（秒）
+    calibration_duration: float = 120.0     # 校准时长（秒）— 从30秒修正为2分钟
+
+    # 小波变换去噪 (对标论文级伪迹去除方法)
+    enable_wavelet_denoising: bool = True
+    wavelet_name: str = "db4"               # 小波基: db4, sym8, coif5 等
+    wavelet_level: int = 5                  # 分解层数
+    wavelet_threshold_mode: str = "soft"    # 阈值模式: soft | hard
+    wavelet_threshold_scale: float = 1.0    # 阈值缩放系数
+
+    # 贝叶斯自适应阈值 (替代纯Z-score方法)
+    enable_bayesian_threshold: bool = False
+    bayesian_prior_mean: float = 50.0
+    bayesian_prior_std: float = 15.0
     baseline_file: str = os.path.join(BASELINE_DIR, "user_baseline.json")
 
     # 自适应阈值
@@ -61,7 +73,7 @@ class SignalEnhancementConfig:
 class DecoderConfig:
     """解码器配置"""
     model_type: str = "fbcsp_lda"  # fbcsp_lda | eegnet | csbrain
-    n_classes: int = 6             # 预设动作数量
+    n_classes: int = 6             # 预设动作数量 (实际可靠控制: 4-6类, 14类不现实)
     # 时间窗口
     window_size: float = 1.0       # 每段分析窗口长度（秒）
     window_stride: float = 0.5     # 窗口滑动步长（秒）
@@ -69,6 +81,12 @@ class DecoderConfig:
     fbcsp_bands: List[tuple] = field(default_factory=lambda: [
         (4, 8), (8, 12), (12, 16), (16, 20), (20, 24), (24, 28), (28, 32), (32, 36)
     ])
+    fbcsp_m: int = 4               # CSP每频段保留的空间滤波器对数
+    # 滑动窗口叠加参数
+    sliding_window_count: int = 100     # 叠加窗口数
+    sliding_window_step_ms: float = 5.0 # 窗口步进(ms)
+    # 置信度阈值 (超过此值才触发命令, 防止误触发)
+    confidence_threshold: float = 0.7   # 0-1
     # EEGNet 参数
     eegnet_dropout: float = 0.5
     # 模型路径
