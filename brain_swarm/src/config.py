@@ -2,7 +2,7 @@
 
 import os
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional, Tuple
 
 # 项目根目录
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -105,10 +105,40 @@ class DroneConfig:
 
 
 @dataclass
+class SSVEPConfig:
+    """SSVEP 频域解码配置 (最实用的实时方案)"""
+    frequencies: List[float] = field(default_factory=lambda: [6.0, 6.67, 7.5, 8.57, 10.0, 12.0])
+    command_labels: List[str] = field(default_factory=lambda: ["左转", "右转", "前进", "悬停", "返航", "紧急"])
+    window_duration: float = 2.0          # FFT分析窗口(秒)
+    snr_threshold: float = 3.0            # 检测阈值
+    occipital_channels: List[int] = field(default_factory=lambda: [0])
+    use_harmonics: bool = True
+    harmonic_count: int = 2
+    confidence_threshold: float = 0.6
+    enable: bool = False                  # 默认关闭, 用户可选择开启
+
+
+@dataclass
+class BiosignalConfig:
+    """多模态生物信号配置 (EOG眨眼/眼动 + EMG咬牙)"""
+    enable: bool = True
+    blink_threshold: float = 3.0
+    eye_move_threshold: float = 2.0
+    jaw_clench_threshold: float = 5.0
+    # 按键映射
+    blink_action: str = "confirm"
+    eye_left_action: str = "prev"
+    eye_right_action: str = "next"
+    jaw_clench_action: str = "emergency_stop"
+
+
+@dataclass
 class PipelineConfig:
     """实时 Pipeline 配置"""
     eeg: EEGConfig = field(default_factory=EEGConfig)
     decoder: DecoderConfig = field(default_factory=DecoderConfig)
+    ssvep: SSVEPConfig = field(default_factory=SSVEPConfig)
+    biosignal: BiosignalConfig = field(default_factory=BiosignalConfig)
     drone: DroneConfig = field(default_factory=DroneConfig)
     signal_enhancement: SignalEnhancementConfig = field(default_factory=SignalEnhancementConfig)
     # 预设动作配置文件
