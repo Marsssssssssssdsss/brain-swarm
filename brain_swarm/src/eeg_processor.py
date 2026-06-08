@@ -1,6 +1,6 @@
 """EEG 信号预处理模块
 
-负责：带通滤波、陷波滤波、公共平均参考、伪迹去除、分段、信号质量评估
+负责：带通滤波(0.5-100Hz)、陷波滤波、公共平均参考、伪迹去除、小波去噪、分段、信号质量评估
 """
 
 import numpy as np
@@ -14,10 +14,16 @@ from signal_enhancer import ArtifactDetector, SignalQualityMonitor, SignalQualit
 class EEGProcessor:
     """EEG 信号实时预处理"""
 
-    def __init__(self, n_channels: int = 8, sampling_rate: int = 250):
+    def __init__(self, n_channels: int = 8, sampling_rate: int = 250,
+                 enable_wavelet: bool = True,
+                 wavelet_name: str = "db4",
+                 wavelet_level: int = 5):
         self.n_channels = n_channels
         self.sampling_rate = sampling_rate
         self._filters_built = False
+        self.enable_wavelet = enable_wavelet
+        self.wavelet_name = wavelet_name
+        self.wavelet_level = wavelet_level
 
         # 信号增强组件
         self.artifact_detector = ArtifactDetector()
@@ -40,11 +46,11 @@ class EEGProcessor:
 
     def build_filters(
         self,
-        low_freq: float = 1.0,
-        high_freq: float = 50.0,
+        low_freq: float = 0.5,
+        high_freq: float = 100.0,
         notch_freq: float = 50.0
     ):
-        """构建滤波器系数"""
+        """构建滤波器系数 (修正: 带宽从1-50Hz扩展到0.5-100Hz, 保留SCP和gamma)"""
         nyquist = self.sampling_rate / 2.0
 
         # 带通滤波器 (FIR)
@@ -81,7 +87,7 @@ class EEGProcessor:
 
     def preprocess(self, raw_chunk: np.ndarray, reject_artifacts: bool = True) -> np.ndarray:
         """
-        完整预处理流水线
+        完整预处理流水线 (修正: 滤波带宽 0.5-100Hz, 添加小波去噪)
 
         Args:
             raw_chunk: (n_channels, n_samples) 原始 EEG 数据
@@ -95,13 +101,22 @@ class EEGProcessor:
         # 1. 去直流分量
         data = data - data.mean(axis=-1, keepdims=True)
 
-        # 2. 带通滤波
+        # 2. 带通滤波 (0.5-100Hz)
         data = self.apply_bandpass(data)
 
-        # 3. 陷波滤波
+        # 3. 陷波滤波 (50Hz)
         data = self.apply_notch(data)
 
-        # 4. 公共平均参考
+        # 4. 小波变换去噪 (新增, 对标论文级伪迹去除)
+        if self.enable_wavelet:
+            try:
+                data = self.artifact_detector.wavelet_denoise(
+                    data, wavelet_name=self.wavelet_name, level=self.wavelet_level
+                )
+            except ImportError:
+                pass  # 无pywt库时跳过
+
+        # 5. 公共平均参考
         data = self.apply_car(data)
 
         return data
