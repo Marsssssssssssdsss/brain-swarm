@@ -1,14 +1,14 @@
 """脑信号解码模块
 
-实现：FBCSP+LDA 分类器、EEGNet 深度学习模型、脑基础模型接口
+实现：FBCSP+LDA 分类器、EEGNet 深度学习模型、SSVEP 频域解码器
 """
 
 import os
 import numpy as np
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Union
 from abc import ABC, abstractmethod
 
-from config import DecoderConfig
+from config import DecoderConfig, SSVEPConfig
 
 
 class BaseDecoder(ABC):
@@ -302,9 +302,20 @@ class SimpleCNN(BaseDecoder):
             self._model.load_state_dict(state)
 
 
-def create_decoder(config: DecoderConfig) -> BaseDecoder:
+def create_decoder(config: Union[DecoderConfig, SSVEPConfig]) -> BaseDecoder:
     """解码器工厂函数"""
-    if config.model_type == "fbcsp_lda":
+    if isinstance(config, SSVEPConfig):
+        from ssvep_decoder import SSVEPDecoder as SSVEPDec
+        from ssvep_decoder import SSVEPConfig as SSVEPCfg
+        return SSVEPDec(SSVEPCfg(
+            frequencies=config.frequencies,
+            command_labels=config.command_labels,
+            sampling_rate=250,
+            window_duration=config.window_duration,
+            snr_threshold=config.snr_threshold,
+            confidence_threshold=config.confidence_threshold,
+        ))
+    elif config.model_type == "fbcsp_lda":
         return FBCSPDecoder(config)
     elif config.model_type == "eegnet":
         return SimpleCNN(config)
