@@ -2,7 +2,8 @@
 
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
+import os
 
 # 项目根目录
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -133,12 +134,33 @@ class BiosignalConfig:
 
 
 @dataclass
+class ContinuousControlConfig:
+    """纯脑信号连续比例控制配置 (mu节律)"""
+    sampling_rate: int = 250
+    c3_channel: int = 0
+    c4_channel: int = 1
+    cz_channel: int = 2
+    mu_low: float = 8.0
+    mu_high: float = 12.0
+    smooth_factor: float = 0.3
+    dead_zone: float = 0.05
+    max_speed: float = 1.0
+    baseline_adapt_rate: float = 0.01
+    baseline_window: float = 10.0
+    fft_window_ms: float = 500
+    fft_step_ms: float = 33
+    click_threshold: float = 2.5
+    n_channels: int = 6
+
+
+@dataclass
 class PipelineConfig:
     """实时 Pipeline 配置"""
     eeg: EEGConfig = field(default_factory=EEGConfig)
     decoder: DecoderConfig = field(default_factory=DecoderConfig)
     ssvep: SSVEPConfig = field(default_factory=SSVEPConfig)
     biosignal: BiosignalConfig = field(default_factory=BiosignalConfig)
+    continuous: ContinuousControlConfig = field(default_factory=ContinuousControlConfig)
     drone: DroneConfig = field(default_factory=DroneConfig)
     signal_enhancement: SignalEnhancementConfig = field(default_factory=SignalEnhancementConfig)
     # 预设动作配置文件
