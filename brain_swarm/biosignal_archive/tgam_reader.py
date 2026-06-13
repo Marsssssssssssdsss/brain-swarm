@@ -6,6 +6,7 @@ TGAM (NeuroSky 神念科技) 是最便宜的单通道脑电方案，淘宝 ¥80~
 输出内容：
 - 专注度 (0-100)
 - 放松度 (0-100)
+- 眨眼强度
 - 原始脑电信号
 - 8 频段能量谱
 - 信号质量
@@ -43,6 +44,7 @@ class TGAMData:
     """TGAM 数据包"""
     attention: int = 0      # 专注度 0-100
     meditation: int = 0     # 放松度 0-100
+    blink: int = 0          # 眨眼强度
     raw_eeg: int = 0        # 原始脑电信号
     signal_quality: int = 0 # 信号质量 (0=好, 200=差)
     # 8 频段能量值
@@ -238,6 +240,11 @@ class TGAMParser:
                     self._meditation_history.append(payload[i])
                     i += 1
 
+            elif code == 0x16:  # 眨眼强度
+                if i < len(payload):
+                    self._current.blink = payload[i]
+                    i += 1
+
             elif code == 0x80:  # 原始脑电信号
                 if i + 1 < len(payload):
                     # 16-bit 有符号整数，高字节在前
@@ -387,6 +394,7 @@ class TGAMSimulator:
     def __init__(self, simulate_signal_degradation: bool = True):
         self._attention = 50
         self._meditation = 50
+        self._blink = 0
         self._direction = 1  # 1=上升, -1=下降
         self._callbacks = []
         self._simulate_degradation = simulate_signal_degradation
@@ -428,6 +436,9 @@ class TGAMSimulator:
         self._meditation = 100 - self._attention + random.uniform(-10, 10)
         self._meditation = max(0, min(100, self._meditation))
 
+        # 偶尔模拟眨眼
+        self._blink = random.randint(0, 100) if random.random() < 0.1 else 0
+
         # 模拟原始EEG（信号差时加噪声）
         base_eeg = random.randint(-200, 200)
         if self._signal_quality > 100:
@@ -440,6 +451,7 @@ class TGAMSimulator:
         data = TGAMData(
             attention=int(self._attention),
             meditation=int(self._meditation),
+            blink=self._blink,
             signal_quality=self._signal_quality,
             raw_eeg=base_eeg,
             timestamp=time.time()

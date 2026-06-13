@@ -120,18 +120,8 @@ class SSVEPConfig:
 
 
 @dataclass
-class FocusLoopConfig:
-    """EEG 专注度闭环检测配置"""
-    enable: bool = True
-    fft_window: float = 2.0
-    update_rate: float = 4.0
-    smoothing: float = 0.3
-    focus_threshold: float = 60.0
-    relax_threshold: float = 60.0
-
-
-@dataclass
 class BiosignalConfig:
+    """EEG-only 专注度+放松度配置"""
     pass
 
 
@@ -194,7 +184,6 @@ class PipelineConfig:
     eeg: EEGConfig = field(default_factory=EEGConfig)
     decoder: DecoderConfig = field(default_factory=DecoderConfig)
     ssvep: SSVEPConfig = field(default_factory=SSVEPConfig)
-    focus_loop: FocusLoopConfig = field(default_factory=FocusLoopConfig)
     biosignal: BiosignalConfig = field(default_factory=BiosignalConfig)
     continuous: ContinuousControlConfig = field(default_factory=ContinuousControlConfig)
     drone: DroneConfig = field(default_factory=DroneConfig)

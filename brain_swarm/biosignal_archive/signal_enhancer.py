@@ -72,6 +72,24 @@ class ArtifactDetector:
         self.kurtosis_threshold = kurtosis_threshold
         self.dead_channel_std = dead_channel_std
 
+    def detect_muscle_artifacts(self, segment: np.ndarray) -> Tuple[bool, float]:
+        """
+        检测肌肉伪迹：高频高幅信号
+
+        Args:
+            segment: (n_channels, n_samples) 或 (n_samples,) 的EEG片段
+
+        Returns:
+            (has_artifact, ratio_of_bad_samples)
+        """
+        if segment.ndim == 1:
+            segment = segment[np.newaxis, :]
+
+        total = segment.size
+        bad = np.sum(np.abs(segment) > self.amplitude_threshold)
+        ratio = bad / total
+        return ratio > 0.05, ratio  # 超过5%采样点异常
+
     def detect_saturation(self, segment: np.ndarray) -> Tuple[bool, float]:
         """
         检测信号饱和（ADC溢出）
@@ -112,6 +130,34 @@ class ArtifactDetector:
                 mask[ch] = False
 
         return not np.all(mask), mask
+
+    def detect_blink_artifact(self, segment: np.ndarray, sampling_rate: int = 250) -> Tuple[bool, float]:
+        """
+        检测眼动/眨眼伪迹：前额通道出现大幅低频尖峰
+
+        在TGAM单通道场景下特别重要——眨眼会严重干扰专注度读数
+        """
+        if segment.ndim > 1:
+            segment = segment[0]  # TGAM只用第一通道
+
+        # 计算峰度：眨眼会产生尖锐的尖峰
+        mean = np.mean(segment)
+        std = np.std(segment)
+        if std < 1e-9:
+            return False, 0.0
+
+        n = len(segment)
+        kurtosis = np.sum(((segment - mean) / std) ** 4) / n - 3  # 超额峰度
+
+        # 高频能量比例：眨眼时高频能量突然增加
+        freqs = np.fft.rfftfreq(len(segment), 1.0 / sampling_rate)
+        fft = np.abs(np.fft.rfft(segment))
+        high_band = fft[freqs > 20].sum()
+        total_power = fft.sum()
+        high_ratio = high_band / total_power if total_power > 0 else 0
+
+        is_blink = kurtosis > self.kurtosis_threshold and high_ratio > 0.3
+        return is_blink, kurtosis
 
     def wavelet_denoise(self, data: np.ndarray, wavelet_name: str = "db4",
                         level: int = 5, threshold_mode: str = "soft",
@@ -176,15 +222,27 @@ class ArtifactDetector:
         """执行所有伪迹检测"""
         results = {}
 
+        # 肌肉伪迹
+        has_muscle, muscle_ratio = self.detect_muscle_artifacts(segment)
+        results['muscle_artifact'] = {'detected': has_muscle, 'ratio': muscle_ratio}
+
+        # 饱和检测
         has_sat, sat_ratio = self.detect_saturation(segment)
         results['saturation'] = {'detected': has_sat, 'ratio': sat_ratio}
 
+        # 电极脱落
         has_dropout, ch_mask = self.detect_channel_dropout(segment)
         results['channel_dropout'] = {'detected': has_dropout, 'mask': ch_mask.tolist()}
 
+        # 眨眼伪迹（TGAM单通道关键检测）
+        has_blink, kurt = self.detect_blink_artifact(segment, sampling_rate)
+        results['blink_artifact'] = {'detected': has_blink, 'kurtosis': kurt}
+
         results['any_artifact'] = any([
+            results['muscle_artifact']['detected'],
             results['saturation']['detected'],
             results['channel_dropout']['detected'],
+            results['blink_artifact']['detected'],
         ])
 
         return results
@@ -1196,6 +1254,10 @@ class SignalEnhancer:
 
         if artifacts.get('any_artifact', False):
             parts = []
+            if artifacts.get('muscle_artifact', {}).get('detected'):
+                parts.append('肌肉伪迹')
+            if artifacts.get('blink_artifact', {}).get('detected'):
+                parts.append('眨眼伪迹')
             if artifacts.get('saturation', {}).get('detected'):
                 parts.append('信号饱和')
             if artifacts.get('channel_dropout', {}).get('detected'):

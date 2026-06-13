@@ -1,11 +1,12 @@
-"""实时主控 Pipeline (v2 — EEG 纯脑波控制)
+"""实时主控 Pipeline (v2 — 多模态集成)
 
 核心设计:
-  1. SSVEP 频域解码 (1-2秒/命令)
-  2. FBCSP+LDA 运动想象 (0.5-1秒)
-  3. 试次锁定平均 (训练时使用) — 模型校准
+  1. SSVEP 频域解码 (1-2秒/命令, 准确率~90%) — 主要控制通道
+  2. FBCSP+LDA 运动想象 (0.5-1秒, 准确率~70%) — 备用控制通道
+  3. EOG/EMG 生物信号 (实时检测, 可靠性极高) — 安全/辅助通道
+  4. 试次锁定平均 (训练时使用) — 模型校准
 
-EEG 采集 → 预处理 → 解码 → 动作映射 → 集群控制
+EEG 采集 → 预处理 → 多模态融合解码 → 动作映射 → 集群控制
 """
 
 import time
@@ -17,7 +18,7 @@ from config import PipelineConfig
 from eeg_processor import EEGProcessor, EEGSimulator
 from brain_decoder import BaseDecoder, FBCSPDecoder, SimpleCNN, create_decoder
 from ssvep_decoder import SSVEPDecoder
-from biosignal import TrialAverager
+from biosignal import BiosignalDetector, TrialAverager
 from action_mapper import ActionMapper, DroneCommand
 from drone_controller import DroneSwarmController
 
@@ -29,7 +30,8 @@ class BrainSwarmPipeline:
     脑控无人机集群主控 Pipeline (v2)
 
     特色:
-      - SSVEP + 运动想象 双通道解码
+      - 多模态融合: SSVEP + EOG/EMG + 运动想象
+      - 降级策略: 信号差时自动回退到 EOG/EMG 控制
       - 试次锁定训练: 用于训练 FBCSP/LDA 分类器
 
     用法:
@@ -47,6 +49,7 @@ class BrainSwarmPipeline:
         )
         self.decoder: Optional[BaseDecoder] = None
         self.ssvep_decoder: Optional[SSVEPDecoder] = None
+        self.biosignal: Optional[BiosignalDetector] = None
         self.action_mapper: Optional[ActionMapper] = None
         self.swarm: Optional[DroneSwarmController] = None
         self.eeg_sim: Optional[EEGSimulator] = None
@@ -88,14 +91,24 @@ class BrainSwarmPipeline:
             n_cmds = len(self.config.ssvep.frequencies)
             print(f"[OK] SSVEP 解码器 ({n_cmds} 频率, {self.config.ssvep.window_duration}s)")
 
-        # 4. 加载预设动作
+        # 4. 创建多模态生物信号检测器
+        if self.config.biosignal.enable:
+            self.biosignal = BiosignalDetector(
+                sampling_rate=self.config.eeg.sampling_rate,
+                blink_threshold=self.config.biosignal.blink_threshold,
+                eye_move_threshold=self.config.biosignal.eye_move_threshold,
+                jaw_clench_threshold=self.config.biosignal.jaw_clench_threshold,
+            )
+            print(f"[OK] 多模态检测器 (EOG眨眼+眼动 + EMG咬牙)")
+
+        # 5. 加载预设动作
         self.action_mapper = ActionMapper(
             action_file=self.config.action_file,
             smooth_count=self.config.smooth_count
         )
         print(f"[OK] 动作映射器 ({len(self.action_mapper.actions)} 个命令)")
 
-        # 5. 初始化无人机集群
+        # 6. 初始化无人机集群
         self.swarm = DroneSwarmController(
             n_drones=self.config.drone.n_drones,
             simulation=self.config.drone.simulation,
@@ -105,7 +118,7 @@ class BrainSwarmPipeline:
         )
         print(f"[OK] 无人机集群 ({self.config.drone.n_drones} 架, {'模拟' if self.config.drone.simulation else '真实'})")
 
-        # 6. EEG 模拟器
+        # 7. EEG 模拟器
         self.eeg_sim = EEGSimulator(
             n_channels=self.config.eeg.n_channels,
             sampling_rate=self.config.eeg.sampling_rate,
@@ -128,7 +141,9 @@ class BrainSwarmPipeline:
 
     def process_chunk(self, raw_chunk: np.ndarray) -> Optional[DroneCommand]:
         """
-        处理一段 EEG 数据 (EEG-only 解码)
+        多模态融合处理一段 EEG 数据
+
+        优先级: EOG/EMG (安全通道) > SSVEP (主控通道) > MI (备用通道)
 
         Args:
             raw_chunk: (n_channels, n_samples) 原始 EEG
@@ -139,7 +154,33 @@ class BrainSwarmPipeline:
         # 1. 预处理
         clean = self.eeg_proc.preprocess(raw_chunk)
 
-        # 2. SSVEP 解码
+        # 2. EOG/EMG 检测 (最高优先级, 用于安全控制)
+        if self.biosignal is not None:
+            bio_result = self.biosignal.detect(raw_chunk)
+            bio_type = bio_result["combined"]
+
+            if bio_type == "jaw_clench":
+                # 咬牙 → 紧急悬停 (安全通道)
+                cmd = self.action_mapper.get_action_by_type("emergency_stop")
+                if cmd:
+                    cmd.source = "bio"
+                return cmd
+
+            elif bio_type == "eye_left" or bio_type == "eye_right":
+                action = self.config.biosignal.eye_left_action if bio_type == "eye_left" else self.config.biosignal.eye_right_action
+                cmd = self.action_mapper.get_action_by_type(action)
+                if cmd:
+                    cmd.source = "bio"
+                return cmd
+
+            elif bio_type == "blink":
+                action = self.config.biosignal.blink_action
+                cmd = self.action_mapper.get_action_by_type(action)
+                if cmd:
+                    cmd.source = "bio"
+                return cmd
+
+        # 3. SSVEP 解码 (主控通道, 如果启用)
         if self.ssvep_decoder is not None:
             cmd_id, confidence = self.ssvep_decoder.decode(clean)
 
@@ -149,7 +190,7 @@ class BrainSwarmPipeline:
                     command.source = "ssvep"
                 return command
 
-        # 3. 运动想象解码
+        # 4. 运动想象解码 (备用通道)
         if self.decoder is not None and hasattr(self.decoder, 'predict'):
             try:
                 class_id, confidence = self.decoder.predict(clean)
@@ -260,7 +301,7 @@ class BrainSwarmPipeline:
         for a in actions:
             print(f"  [{a['id']}] {a['label']} - {a['type']}")
 
-        print("\n可用命令: 0-5 选择, 's' 状态, 'e' 紧急停止, 'q' 退出\n")
+        print("\n可用命令: 0-5 选择, 's' 状态, 'e' 紧急停止, 'b' 模拟眨眼, 'j' 模拟咬牙, 'q' 退出\n")
 
         try:
             while self._running:
@@ -271,6 +312,18 @@ class BrainSwarmPipeline:
                 elif cmd == 's':
                     self.swarm.print_status()
                 elif cmd == 'e':
+                    print(self.swarm.emergency_stop())
+                elif cmd == 'b':
+                    print("  [模拟] 眨眼确认")
+                    action = self.config.biosignal.blink_action
+                    cmd = self.action_mapper.get_action_by_type(action)
+                    if cmd:
+                        cmd.source = "bio"
+                        result = self.swarm.execute(cmd)
+                        self.commands_executed += 1
+                        print(f"  [{self.commands_executed}] {result}")
+                elif cmd == 'j':
+                    print("  [模拟] 咬牙紧急停止")
                     print(self.swarm.emergency_stop())
                 elif cmd.isdigit():
                     class_id = int(cmd)

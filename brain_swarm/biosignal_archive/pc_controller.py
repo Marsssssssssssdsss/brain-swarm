@@ -2,6 +2,7 @@
 
 用 TGAM 脑电模块控制电脑：
 - 专注度 > 自适应阈值 → 触发键盘快捷键
+- 眨眼 → 切换动作模式
 - 放松度 → 退出/取消
 
 信号衰减处理：
@@ -40,14 +41,24 @@ class BrainTrigger:
     """脑电触发条件"""
     name: str
     condition_desc: str
+    # 触发条件：专注度阈值
     attention_min: int = 0
     attention_max: int = 100
     meditation_min: int = 0
     meditation_max: int = 100
+    blink_min: int = 0  # 0 = 不需要眨眼
+    # 平滑次数
     sustain_count: int = 3
+    # 冷却时间（秒）
     cooldown: float = 1.5
 
-    def check(self, attention: float, meditation: float) -> bool:
+    def check(self, attention: float, meditation: float, blink: int) -> bool:
+        """检查是否满足触发条件"""
+        # 眨眼检查
+        if self.blink_min > 0:
+            if blink < self.blink_min:
+                return False
+        # 专注度 + 放松度
         return (self.attention_min <= attention <= self.attention_max and
                 self.meditation_min <= meditation <= self.meditation_max)
 
@@ -60,6 +71,7 @@ class BrainPcController:
 
     控制方案：
     - 不同专注度范围 → 不同的预设动作
+    - 眨眼 → 确认/切换
     - 专注 > 自适应阈值 → 触发当前选中动作
 
     信号衰减处理：
@@ -83,6 +95,9 @@ class BrainPcController:
         self._attention_buffer: deque = deque(maxlen=10)
         self._trigger_buffer: deque = deque(maxlen=5)
         self._last_trigger_time = 0.0
+        self._blink_count = 0
+        self._last_blink_time = 0.0
+        self._blink_window = []
         self._cooldown = 2.0
         self._mode = "idle"  # idle / calibrating / scanning / triggered
 
@@ -155,6 +170,7 @@ class BrainPcController:
 
         attention = data.attention
         meditation = data.meditation
+        blink = data.blink
 
         # ─── 校准模式 ───
         if self._mode == "calibrating":
@@ -207,12 +223,27 @@ class BrainPcController:
         # ─── 漂移补偿 ───
         compensated_attention = self._drift_compensator.detrend(avg_attention)
 
+        # ─── 眨眼检测 ───
+        if blink > 50:
+            self._blink_window.append(now)
+            self._blink_window = [t for t in self._blink_window if now - t < 1.0]
+
         # ─── 冷却检查 ───
         if now - self._last_trigger_time < self._cooldown:
             return
 
+        # ─── 控制逻辑 ───
+
+        # 双眨眼：切换动作
+        if len(self._blink_window) >= 2:
+            self._current_action_idx = (self._current_action_idx + 1) % len(self.actions)
+            action = self.actions[self._current_action_idx]
+            print(f"  [切换] → {action[0]}: {action[1]}")
+            self._blink_window = []
+            self._last_trigger_time = now
+
         # 高专注：执行当前动作（使用自适应阈值 + 补偿后专注度）
-        if compensated_attention >= self._current_threshold:
+        elif compensated_attention >= self._current_threshold:
             self._trigger_buffer.append(True)
             if len(self._trigger_buffer) >= 3:
                 self._execute_current_action()

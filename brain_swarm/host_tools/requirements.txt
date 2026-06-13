@@ -1,0 +1,7 @@
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+pyserial>=3.5
+rich>=13.0
+bleak>=0.20
+pandas>=2.0
